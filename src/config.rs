@@ -74,31 +74,7 @@ fn ack_grace_default() -> u64 {
     300
 }
 
-#[derive(Clone, Deserialize)]
-pub struct Registration {
-    pub id: String,
-    pub as_token: String,
-    pub hs_token: String,
-    pub sender_localpart: String,
-    pub namespaces: Namespaces,
-}
-#[derive(Clone, Deserialize)]
-pub struct Namespaces {
-    pub users: Vec<Namespace>,
-}
-#[derive(Clone, Deserialize)]
-pub struct Namespace {
-    pub regex: String,
-    pub exclusive: bool,
-}
-
-#[derive(Deserialize)]
-pub struct RegistrationBundle {
-    pub registration: Registration,
-    pub homeserver_url: Url,
-    pub homeserver_domain: String,
-    pub your_user_id: String,
-}
+pub use drawbridge_matrix::{Namespace, Namespaces, Registration, RegistrationBundle};
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
@@ -164,11 +140,7 @@ impl Config {
 
 impl Tenant {
     pub fn bundle(&self) -> Result<RegistrationBundle> {
-        let bundle: RegistrationBundle = serde_json::from_str(
-            &std::fs::read_to_string(&self.registration)
-                .context("read registration JSON bundle")?,
-        )
-        .context("registration must be the full bbctl register --json response")?;
+        let bundle = RegistrationBundle::load(&self.registration)?;
         ensure!(
             bundle.homeserver_url == self.homeserver,
             "homeserver differs from registration bundle"
@@ -176,10 +148,6 @@ impl Tenant {
         ensure!(
             bundle.your_user_id == self.owner,
             "owner differs from registration bundle"
-        );
-        ensure!(
-            !bundle.homeserver_domain.is_empty(),
-            "registration domain missing"
         );
         Ok(bundle)
     }
