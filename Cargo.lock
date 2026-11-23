@@ -494,6 +494,19 @@ dependencies = [
 [[package]]
 name = "drawbridge-core"
 version = "0.1.0"
+source = "git+https://github.com/ajmwagar/drawbridge?rev=6757c61bd5aeff41a15f1619a902b78a6b356ee7#6757c61bd5aeff41a15f1619a902b78a6b356ee7"
+dependencies = [
+ "anyhow",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "url",
+]
+
+[[package]]
+name = "drawbridge-core"
+version = "0.1.0"
 source = "git+https://github.com/ajmwagar/drawbridge?rev=ccf409c26ec2347eb3f551dc841252072f86dc94#ccf409c26ec2347eb3f551dc841252072f86dc94"
 dependencies = [
  "anyhow",
@@ -507,10 +520,10 @@ dependencies = [
 [[package]]
 name = "drawbridge-matrix"
 version = "0.1.0"
-source = "git+https://github.com/ajmwagar/drawbridge?rev=ccf409c26ec2347eb3f551dc841252072f86dc94#ccf409c26ec2347eb3f551dc841252072f86dc94"
+source = "git+https://github.com/ajmwagar/drawbridge?rev=6757c61bd5aeff41a15f1619a902b78a6b356ee7#6757c61bd5aeff41a15f1619a902b78a6b356ee7"
 dependencies = [
  "anyhow",
- "drawbridge-core",
+ "drawbridge-core 0.1.0 (git+https://github.com/ajmwagar/drawbridge?rev=6757c61bd5aeff41a15f1619a902b78a6b356ee7)",
  "regex",
  "reqwest",
  "serde",
@@ -1521,7 +1534,7 @@ dependencies = [
  "chrono",
  "clap",
  "ctr",
- "drawbridge-core",
+ "drawbridge-core 0.1.0 (git+https://github.com/ajmwagar/drawbridge?rev=ccf409c26ec2347eb3f551dc841252072f86dc94)",
  "drawbridge-matrix",
  "fs2",
  "futures-util",

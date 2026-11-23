@@ -1,8 +1,6 @@
-use crate::{
-    config::{RegistrationBundle, Tenant},
-    stable_id,
-};
+use crate::config::{RegistrationBundle, Tenant};
 use anyhow::{Context, Result, ensure};
+use drawbridge_matrix::MatrixAppService;
 use reqwest::{
     Client, Method, StatusCode,
     header::{AUTHORIZATION, HeaderValue},
@@ -12,17 +10,18 @@ use url::Url;
 
 #[derive(Clone)]
 pub struct Matrix {
+    inner: MatrixAppService,
     client: Client,
     base: Url,
     token: HeaderValue,
     pub domain: String,
     pub sender: String,
     pub prefix: String,
-    namespaces: Vec<regex::Regex>,
 }
 
 impl Matrix {
     pub fn new(config: &Tenant, bundle: &RegistrationBundle) -> Result<Self> {
+        let inner = MatrixAppService::new(&config.homeserver, bundle)?;
         let registration = &bundle.registration;
         let mut token = HeaderValue::from_str(&format!("Bearer {}", registration.as_token))?;
         token.set_sensitive(true);
@@ -35,15 +34,8 @@ impl Matrix {
             .strip_suffix("bot")
             .context("Beeper sender_localpart must end in bot")?
             .to_string();
-        let namespaces = registration
-            .namespaces
-            .users
-            .iter()
-            .filter(|ns| ns.exclusive)
-            .map(|ns| regex::Regex::new(&format!("^(?:{})$", ns.regex)))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        ensure!(!namespaces.is_empty(), "exclusive user namespace required");
         Ok(Self {
+            inner,
             client: Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(std::time::Duration::from_secs(30))
@@ -53,22 +45,11 @@ impl Matrix {
             domain: bundle.homeserver_domain.clone(),
             sender,
             prefix,
-            namespaces,
         })
     }
 
     pub fn ghost(&self, tenant: &str, bot: &str) -> Result<String> {
-        let user = format!(
-            "@{}_{}:{}",
-            self.prefix,
-            stable_id(&[tenant, bot]),
-            self.domain
-        );
-        ensure!(
-            self.namespaces.iter().any(|ns| ns.is_match(&user)),
-            "ghost is outside registered namespace"
-        );
-        Ok(user)
+        self.inner.ghost_for(&[tenant, bot])
     }
 
     fn url(&self, path: &[&str]) -> Result<Url> {
@@ -120,26 +101,9 @@ impl Matrix {
         Ok(body)
     }
     pub async fn register(&self, user: &str, name: &str) -> Result<()> {
-        let localpart = user
-            .strip_prefix('@')
-            .and_then(|s| s.split_once(':'))
-            .context("invalid ghost")?
-            .0;
-        let (status,body) = self.request(Method::POST,&["register"],None,Some(json!({"type":"m.login.application_service","username":localpart,"inhibit_login":true}))).await?;
-        ensure!(
-            status.is_success()
-                || (status == StatusCode::BAD_REQUEST && body["errcode"] == "M_USER_IN_USE"),
-            "Matrix ghost registration returned HTTP {status}"
-        );
-        self.ok(
-            Method::PUT,
-            &["profile", user, "displayname"],
-            user,
-            Some(json!({"displayname":name})),
-        )
-        .await?;
-        Ok(())
+        self.inner.register_user(user, name).await
     }
+
     pub async fn room(
         &self,
         tenant: &str,
@@ -208,7 +172,8 @@ impl Matrix {
 
     /// @implements url:https://spec.matrix.org/v1.16/client-server-api/ §Content repository, §Profiles, §m.room.avatar
     pub async fn upload_avatar(&self, user: &str, avatar: crate::avatar::Avatar) -> Result<String> {
-        self.upload_media(user, "avatar", avatar.mime, avatar.bytes)
+        self.inner
+            .upload_media(user, "avatar", avatar.mime, avatar.bytes)
             .await
     }
 
@@ -219,45 +184,7 @@ impl Matrix {
         mime: &str,
         bytes: Vec<u8>,
     ) -> Result<String> {
-        let mut url = self.base.clone();
-        url.path_segments_mut()
-            .map_err(|_| anyhow::anyhow!("invalid Matrix base URL"))?
-            .pop_if_empty()
-            .extend(["_matrix", "media", "v3", "upload"]);
-        url.query_pairs_mut()
-            .append_pair("user_id", user)
-            .append_pair("filename", name);
-        let response = self
-            .client
-            .post(url)
-            .header(AUTHORIZATION, self.token.clone())
-            .header(reqwest::header::CONTENT_TYPE, mime)
-            .body(bytes)
-            .send()
-            .await
-            .map_err(|error| {
-                anyhow::anyhow!("Matrix avatar upload failed: {}", error.without_url())
-            })?;
-        ensure!(
-            response.status().is_success(),
-            "Matrix avatar upload returned HTTP {}",
-            response.status()
-        );
-        let result: Value = response.json().await?;
-        let uri = result["content_uri"]
-            .as_str()
-            .context("Matrix upload missing content_uri")?;
-        let parsed = Url::parse(uri)?;
-        ensure!(
-            parsed.scheme() == "mxc"
-                && parsed.host_str().is_some()
-                && parsed.username().is_empty()
-                && parsed.password().is_none()
-                && parsed.query().is_none()
-                && parsed.fragment().is_none(),
-            "Matrix upload returned invalid media URI"
-        );
-        Ok(uri.to_string())
+        self.inner.upload_media(user, name, mime, bytes).await
     }
 
     pub async fn sync_profile(
@@ -267,50 +194,29 @@ impl Matrix {
         name: &str,
         avatar: &str,
     ) -> Result<()> {
-        self.ok(
-            Method::PUT,
-            &["profile", user, "displayname"],
-            user,
-            Some(json!({"displayname":name})),
-        )
-        .await?;
-        self.ok(
-            Method::PUT,
-            &["profile", user, "avatar_url"],
-            user,
-            Some(json!({"avatar_url":avatar})),
-        )
-        .await?;
-        self.ok(
-            Method::PUT,
-            &["rooms", room, "state", "m.room.avatar", ""],
-            user,
-            Some(json!({"url":avatar})),
-        )
-        .await?;
-        self.ok(
-            Method::PUT,
-            &["rooms", room, "state", "m.room.name", ""],
-            user,
-            Some(json!({"name":format!("{name} · Rakazo")})),
-        )
-        .await?;
+        self.inner.set_displayname(user, name).await?;
+        self.inner.set_avatar(user, avatar).await?;
+        self.inner
+            .send_state(room, user, "m.room.avatar", "", json!({"url": avatar}))
+            .await?;
+        self.inner
+            .send_state(
+                room,
+                user,
+                "m.room.name",
+                "",
+                json!({"name": format!("{name} · Rakazo")}),
+            )
+            .await?;
         Ok(())
     }
 
     pub async fn bridge_identity(&self, avatar: &str) -> Result<()> {
-        self.register(&self.sender, "Rakazo").await?;
-        self.ok(
-            Method::PUT,
-            &["profile", &self.sender, "avatar_url"],
-            &self.sender,
-            Some(json!({"avatar_url":avatar})),
-        )
-        .await?;
+        self.inner.register_user(&self.sender, "Rakazo").await?;
+        self.inner.set_avatar(&self.sender, avatar).await?;
         Ok(())
     }
 
-    /// @implements github:mautrix/go@v0.28.1 bridgev2/portal.go UpdateBridgeInfo -- protocol icon in both bridge state event formats
     pub async fn bridge_info(
         &self,
         binding: &crate::store::Binding,
@@ -321,44 +227,47 @@ impl Matrix {
     ) -> Result<()> {
         let key = format!("rakazo://{}/{}", binding.tenant, binding.bot);
         let content = json!({"bridgebot":self.sender,"creator":binding.ghost,"protocol":{"id":"rakazo","displayname":space_name,"avatar_url":logo},"channel":{"id":binding.bot,"displayname":name,"avatar_url":avatar}});
-        for event_type in ["m.bridge", "uk.half-shot.bridge"] {
-            self.ok(
-                Method::PUT,
-                &["rooms", &binding.room, "state", event_type, &key],
+        self.inner
+            .send_state(
+                &binding.room,
                 &binding.ghost,
-                Some(content.clone()),
+                "m.bridge",
+                &key,
+                content.clone(),
             )
             .await?;
-        }
+        self.inner
+            .send_state(
+                &binding.room,
+                &binding.ghost,
+                "uk.half-shot.bridge",
+                &key,
+                content,
+            )
+            .await?;
         Ok(())
     }
+
     pub async fn room_features(
         &self,
         binding: &crate::store::Binding,
         features: Value,
     ) -> Result<()> {
         let key = format!("rakazo://{}/{}", binding.tenant, binding.bot);
-        self.ok(
-            Method::PUT,
-            &[
-                "rooms",
+        self.inner
+            .send_state(
                 &binding.room,
-                "state",
+                &binding.ghost,
                 "com.beeper.room_features",
                 &key,
-            ],
-            &binding.ghost,
-            Some(features),
-        )
-        .await?;
+                features,
+            )
+            .await?;
         Ok(())
     }
 
-    /// Check authoritative state on every delivery, including after a restart.
     pub async fn check_room(&self, room: &str, ghost: &str, owner: &str) -> Result<()> {
-        let state = self
-            .ok(Method::GET, &["rooms", room, "state"], ghost, None)
-            .await?;
+        let state = self.inner.room_state(room, ghost).await?;
         let events = state
             .as_array()
             .context("Matrix room state must be an array")?;
@@ -387,18 +296,7 @@ impl Matrix {
     }
 
     pub async fn send(&self, room: &str, ghost: &str, transaction: &str, text: &str) -> Result<()> {
-        ensure!(
-            text.len() <= 48_000,
-            "message exceeds Matrix text limit; delivery paused"
-        );
-        self.send_event(
-            room,
-            ghost,
-            transaction,
-            "m.room.message",
-            json!({"msgtype":"m.text","body":text}),
-        )
-        .await?;
+        self.inner.send_text(room, ghost, transaction, text).await?;
         Ok(())
     }
 
@@ -410,52 +308,33 @@ impl Matrix {
         kind: &str,
         content: Value,
     ) -> Result<String> {
-        let response = self
-            .ok(
-                Method::PUT,
-                &["rooms", room, "send", kind, transaction],
-                user,
-                Some(content),
-            )
-            .await?;
-        Ok(response["event_id"]
-            .as_str()
-            .context("Matrix send missing event_id")?
-            .to_string())
-    }
-
-    pub async fn event(&self, room: &str, user: &str, id: &str) -> Result<Value> {
-        self.ok(Method::GET, &["rooms", room, "event", id], user, None)
+        self.inner
+            .send_event(room, user, transaction, kind, content)
             .await
     }
 
+    pub async fn event(&self, room: &str, user: &str, id: &str) -> Result<Value> {
+        self.inner.event(room, user, id).await
+    }
+
     pub async fn redact(&self, room: &str, user: &str, id: &str, transaction: &str) -> Result<()> {
-        let (status, _) = self
-            .request(
-                Method::PUT,
-                &["rooms", room, "redact", id, transaction],
-                Some(user),
-                Some(json!({})),
+        self.inner.redact(room, user, id, transaction).await
+    }
+
+    pub async fn rich_permissions(&self, binding: &crate::store::Binding) -> Result<()> {
+        let (status, mut levels) = self
+            .inner
+            .request_json(
+                Method::GET,
+                &["rooms", &binding.room, "state", "m.room.power_levels", ""],
+                Some(&binding.ghost),
+                None,
             )
             .await?;
         ensure!(
-            status.is_success() || status == StatusCode::NOT_FOUND,
-            "Matrix request returned HTTP {status}"
+            status.is_success(),
+            "managed room power levels missing (HTTP {status})"
         );
-        Ok(())
-    }
-
-    /// Permit owner timeline events using the default checked by Beeper iOS,
-    /// preserving membership, state and moderation restrictions in old rooms.
-    pub async fn rich_permissions(&self, binding: &crate::store::Binding) -> Result<()> {
-        let path = [
-            "rooms",
-            binding.room.as_str(),
-            "state",
-            "m.room.power_levels",
-            "",
-        ];
-        let mut levels = self.ok(Method::GET, &path, &binding.ghost, None).await?;
         let events = levels
             .get_mut("events")
             .and_then(Value::as_object_mut)
@@ -467,46 +346,28 @@ impl Matrix {
                 changed = true;
             }
         }
-        // Beeper iOS treats events_default as the messaging permission even when
-        // m.room.message has a lower explicit override. State uses state_default.
         if levels["events_default"] != 0 {
             levels["events_default"] = json!(0);
             changed = true;
         }
         if changed {
-            self.ok(Method::PUT, &path, &binding.ghost, Some(levels))
+            self.inner
+                .send_state(
+                    &binding.room,
+                    &binding.ghost,
+                    "m.room.power_levels",
+                    "",
+                    levels,
+                )
                 .await?;
         }
         Ok(())
     }
 
     pub async fn room_messages(&self, room: &str, user: &str, from: Option<&str>) -> Result<Value> {
-        let mut url = self.url(&["rooms", room, "messages"])?;
-        url.query_pairs_mut()
-            .append_pair("user_id", user)
-            .append_pair("dir", "b")
-            .append_pair("limit", "1000");
-        if let Some(from) = from {
-            url.query_pairs_mut().append_pair("from", from);
-        }
-        let response = self
-            .client
-            .get(url)
-            .header(AUTHORIZATION, self.token.clone())
-            .send()
-            .await
-            .map_err(|error| {
-                anyhow::anyhow!("Matrix history lookup failed: {}", error.without_url())
-            })?;
-        ensure!(
-            response.status().is_success(),
-            "Matrix history lookup returned HTTP {}",
-            response.status()
-        );
-        Ok(response.json().await?)
+        self.inner.room_messages(room, user, from).await
     }
 
-    /// @implements url:https://spec.matrix.org/v1.16/client-server-api/#get_matrixclientv1mediadownloadservernamemediaid -- authenticated download, bounded bytes and credential-free CDN redirects
     pub async fn download_media(
         &self,
         user: &str,
