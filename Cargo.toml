@@ -9,6 +9,7 @@ description = "Self-hosted and multi-tenant Rakazo to Beeper bridge"
 [dependencies]
 drawbridge-core = { git = "https://github.com/ajmwagar/drawbridge", rev = "ccf409c26ec2347eb3f551dc841252072f86dc94" }
 drawbridge-matrix = { git = "https://github.com/ajmwagar/drawbridge", rev = "6757c61bd5aeff41a15f1619a902b78a6b356ee7" }
+drawbridge-store = { git = "https://github.com/ajmwagar/drawbridge", rev = "51d431bc81b7d1ff7f6ff971f24e34f5083ccf5d" }
 ammonia = "4.2"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 anyhow = "1"

@@ -1,36 +1,17 @@
 use anyhow::{Context, Result, ensure};
-use base64::{Engine, engine::general_purpose::STANDARD};
 use chacha20poly1305::{
-    KeyInit, XChaCha20Poly1305, XNonce,
+    XNonce,
     aead::{Aead, Payload},
 };
-use fs2::FileExt;
 use rand::RngCore;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use std::{
-    fs::{File, OpenOptions},
-    path::Path,
-    sync::Mutex,
-};
+use std::path::Path;
 
 pub struct Store {
-    db: Mutex<Connection>,
-    cipher: XChaCha20Poly1305,
-    _lock: DatabaseLock,
+    database: drawbridge_store::Database,
 }
 
-struct DatabaseLock(File);
-impl Drop for DatabaseLock {
-    fn drop(&mut self) {
-        // Closing alone can leave flock held briefly by a concurrent fork
-        // before exec closes inherited descriptors. Release the owned lease
-        // explicitly, after SQLite (the first Store field) has closed.
-        if let Err(error) = FileExt::unlock(&self.0) {
-            tracing::error!(%error, "could not release database process lock");
-        }
-    }
-}
 #[derive(Clone, Debug)]
 pub struct Binding {
     pub tenant: String,
@@ -69,31 +50,9 @@ pub struct Pending {
 
 impl Store {
     pub fn open(path: &Path, key: &str) -> Result<Self> {
-        let decoded = STANDARD
-            .decode(key)
-            .context("database key must be base64")?;
-        ensure!(decoded.len() == 32, "database key must decode to 32 bytes");
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        std::fs::create_dir_all(parent)?;
-        let mut options = OpenOptions::new();
-        options.create(true).truncate(false).read(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let lock = options.open(path.with_extension("lockfile"))?;
-        lock.try_lock_exclusive()
-            .context("another bridge process owns this database")?;
-        let lock = DatabaseLock(lock);
-        // Create with restrictive permissions before SQLite opens WAL files.
-        let _ = options.open(path)?;
-        let db = Connection::open(path)?;
-        db.busy_timeout(std::time::Duration::from_secs(5))?;
-        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
+        let database = drawbridge_store::Database::open_raw(path, key, "rakazo-beeper-v1")?;
+        let store = Self { database };
+        store.database.conn.lock().unwrap().execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
             CREATE TABLE IF NOT EXISTS tenants (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS bindings (
@@ -128,35 +87,9 @@ impl Store {
             CREATE TABLE IF NOT EXISTS bridge_outbound (
               tenant TEXT NOT NULL, bot TEXT NOT NULL, nonce TEXT NOT NULL, purpose TEXT NOT NULL,
               PRIMARY KEY(tenant,bot,nonce));")?;
-        let store = Self {
-            db: Mutex::new(db),
-            cipher: XChaCha20Poly1305::new_from_slice(&decoded).unwrap(),
-            _lock: lock,
-        };
-        let saved: Option<Vec<u8>> = store
-            .db
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT value FROM metadata WHERE key='key-check'",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(saved) = saved {
-            ensure!(
-                store.decrypt("key-check", &saved)? == b"rakazo-beeper-v1",
-                "incorrect database key"
-            );
-        } else {
-            store.db.lock().unwrap().execute(
-                "INSERT INTO metadata VALUES ('key-check',?1)",
-                [store.encrypt("key-check", b"rakazo-beeper-v1")?],
-            )?;
-        }
         // Upgrade old queue metadata without retaining any completed message body.
         {
-            let mut db = store.db.lock().unwrap();
+            let mut db = store.database.conn.lock().unwrap();
             let rows = {
                 let mut query=db.prepare("SELECT tenant,event_id,room FROM inbox WHERE NOT EXISTS(SELECT 1 FROM event_nonces WHERE event_nonces.tenant=inbox.tenant AND event_nonces.event_id=inbox.event_id)")?;
                 query
@@ -182,14 +115,14 @@ impl Store {
     }
 
     pub fn profile(&self, tenant: &str, bot: &str) -> Result<Option<Profile>> {
-        Ok(self.db.lock().unwrap().query_row("SELECT avatar_hash,avatar_uri,applied_hash FROM profiles WHERE tenant=?1 AND bot=?2", params![tenant,bot], |row| Ok(Profile {avatar_hash:row.get(0)?,avatar_uri:row.get(1)?,applied_hash:row.get(2)?})).optional()?)
+        Ok(self.database.conn.lock().unwrap().query_row("SELECT avatar_hash,avatar_uri,applied_hash FROM profiles WHERE tenant=?1 AND bot=?2", params![tenant,bot], |row| Ok(Profile {avatar_hash:row.get(0)?,avatar_uri:row.get(1)?,applied_hash:row.get(2)?})).optional()?)
     }
     pub fn link(&self, binding: &Binding, link: &MessageLink) -> Result<()> {
-        self.db.lock().unwrap().execute("INSERT INTO message_links VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(tenant,bot,rakazo_id,part) DO UPDATE SET matrix_id=excluded.matrix_id,role=excluded.role,kind=excluded.kind,hash=excluded.hash",params![binding.tenant,binding.bot,link.rakazo_id,link.part,link.matrix_id,link.role,link.kind,link.hash])?;
+        self.database.conn.lock().unwrap().execute("INSERT INTO message_links VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(tenant,bot,rakazo_id,part) DO UPDATE SET matrix_id=excluded.matrix_id,role=excluded.role,kind=excluded.kind,hash=excluded.hash",params![binding.tenant,binding.bot,link.rakazo_id,link.part,link.matrix_id,link.role,link.kind,link.hash])?;
         Ok(())
     }
     pub fn links(&self, binding: &Binding, id: &str) -> Result<Vec<MessageLink>> {
-        let db = self.db.lock().unwrap();
+        let db = self.database.conn.lock().unwrap();
         let mut query=db.prepare("SELECT rakazo_id,matrix_id,part,role,kind,hash FROM message_links WHERE tenant=?1 AND bot=?2 AND rakazo_id=?3 ORDER BY part")?;
         Ok(query
             .query_map(params![binding.tenant, binding.bot, id], |row| {
@@ -205,7 +138,7 @@ impl Store {
             .collect::<rusqlite::Result<_>>()?)
     }
     pub fn all_links(&self, binding: &Binding) -> Result<Vec<MessageLink>> {
-        let db = self.db.lock().unwrap();
+        let db = self.database.conn.lock().unwrap();
         let mut query = db.prepare("SELECT rakazo_id,matrix_id,part,role,kind,hash FROM message_links WHERE tenant=?1 AND bot=?2 ORDER BY rakazo_id,part")?;
         Ok(query
             .query_map(params![binding.tenant, binding.bot], |row| {
@@ -227,7 +160,7 @@ impl Store {
         preserved: &[MessageLink],
         preserved_runs: &std::collections::HashSet<String>,
     ) -> Result<()> {
-        let mut db = self.db.lock().unwrap();
+        let mut db = self.database.conn.lock().unwrap();
         let tx = db.transaction()?;
         tx.execute(
             "DELETE FROM message_links WHERE tenant=?1 AND bot=?2",
@@ -273,11 +206,12 @@ impl Store {
         Ok(())
     }
     pub fn matrix_link(&self, binding: &Binding, id: &str) -> Result<Option<MessageLink>> {
-        Ok(self.db.lock().unwrap().query_row("SELECT rakazo_id,matrix_id,part,role,kind,hash FROM message_links WHERE tenant=?1 AND bot=?2 AND matrix_id=?3 LIMIT 1",params![binding.tenant,binding.bot,id],|row|Ok(MessageLink {rakazo_id:row.get(0)?,matrix_id:row.get(1)?,part:row.get(2)?,role:row.get(3)?,kind:row.get(4)?,hash:row.get(5)?})).optional()?)
+        Ok(self.database.conn.lock().unwrap().query_row("SELECT rakazo_id,matrix_id,part,role,kind,hash FROM message_links WHERE tenant=?1 AND bot=?2 AND matrix_id=?3 LIMIT 1",params![binding.tenant,binding.bot,id],|row|Ok(MessageLink {rakazo_id:row.get(0)?,matrix_id:row.get(1)?,part:row.get(2)?,role:row.get(3)?,kind:row.get(4)?,hash:row.get(5)?})).optional()?)
     }
     pub fn receipt(&self, binding: &Binding, id: &str) -> Result<Option<i64>> {
         Ok(self
-            .db
+            .database
+            .conn
             .lock()
             .unwrap()
             .query_row(
@@ -292,7 +226,7 @@ impl Store {
         binding: &Binding,
         run: &str,
     ) -> Result<Option<(String, Option<String>)>> {
-        Ok(self.db.lock().unwrap().query_row("SELECT event_id,thread_root FROM run_routes WHERE tenant=?1 AND bot=?2 AND run_id=?3",params![binding.tenant,binding.bot,run],|row|Ok((row.get(0)?,row.get(1)?))).optional()?)
+        Ok(self.database.conn.lock().unwrap().query_row("SELECT event_id,thread_root FROM run_routes WHERE tenant=?1 AND bot=?2 AND run_id=?3",params![binding.tenant,binding.bot,run],|row|Ok((row.get(0)?,row.get(1)?))).optional()?)
     }
     pub fn save_run_route(
         &self,
@@ -301,18 +235,18 @@ impl Store {
         event: &str,
         thread: Option<&str>,
     ) -> Result<()> {
-        self.db.lock().unwrap().execute("INSERT INTO run_routes VALUES(?1,?2,?3,?4,?5) ON CONFLICT(tenant,bot,run_id) DO UPDATE SET event_id=excluded.event_id,thread_root=excluded.thread_root",params![binding.tenant,binding.bot,run,event,thread])?;
+        self.database.conn.lock().unwrap().execute("INSERT INTO run_routes VALUES(?1,?2,?3,?4,?5) ON CONFLICT(tenant,bot,run_id) DO UPDATE SET event_id=excluded.event_id,thread_root=excluded.thread_root",params![binding.tenant,binding.bot,run,event,thread])?;
         Ok(())
     }
     pub fn pending_room_count(&self, binding: &Binding) -> Result<i64> {
-        Ok(self.db.lock().unwrap().query_row(
+        Ok(self.database.conn.lock().unwrap().query_row(
             "SELECT COUNT(*) FROM inbox WHERE tenant=?1 AND room=?2 AND state='pending'",
             params![binding.tenant, binding.room],
             |row| row.get(0),
         )?)
     }
     pub fn sent_event(&self, binding: &Binding, event: &str) -> Result<bool> {
-        Ok(self.db.lock().unwrap().query_row(
+        Ok(self.database.conn.lock().unwrap().query_row(
             "SELECT EXISTS(SELECT 1 FROM inbox WHERE tenant=?1 AND room=?2 AND event_id=?3 AND state='sent')",
             params![binding.tenant, binding.room, event],
             |row| row.get(0),
@@ -320,7 +254,8 @@ impl Store {
     }
     pub fn event_for_seq(&self, binding: &Binding, seq: i64) -> Result<Option<String>> {
         Ok(self
-            .db
+            .database
+            .conn
             .lock()
             .unwrap()
             .query_row(
@@ -332,7 +267,8 @@ impl Store {
     }
     pub fn event_for_nonce(&self, binding: &Binding, nonce: &str) -> Result<Option<String>> {
         Ok(self
-            .db
+            .database
+            .conn
             .lock()
             .unwrap()
             .query_row(
@@ -344,7 +280,7 @@ impl Store {
     }
     /// The runs started by one inbound event, oldest first.
     pub fn runs_for_event(&self, binding: &Binding, event: &str) -> Result<Vec<String>> {
-        let db = self.db.lock().unwrap();
+        let db = self.database.conn.lock().unwrap();
         let mut query = db.prepare(
             "SELECT run_id FROM run_routes WHERE tenant=?1 AND bot=?2 AND event_id=?3 ORDER BY run_id",
         )?;
@@ -355,7 +291,7 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
     pub fn complete_send(&self, binding: &Binding, id: i64, event: &str, seq: i64) -> Result<()> {
-        let mut db = self.db.lock().unwrap();
+        let mut db = self.database.conn.lock().unwrap();
         let tx = db.transaction()?;
         tx.execute(
             "INSERT OR IGNORE INTO send_receipts VALUES(?1,?2,?3,?4)",
@@ -370,7 +306,8 @@ impl Store {
     }
     pub fn cached_media(&self, binding: &Binding, source: &str) -> Result<Option<String>> {
         Ok(self
-            .db
+            .database
+            .conn
             .lock()
             .unwrap()
             .query_row(
@@ -381,18 +318,18 @@ impl Store {
             .optional()?)
     }
     pub fn cache_media(&self, binding: &Binding, source: &str, uri: &str) -> Result<()> {
-        self.db.lock().unwrap().execute("INSERT INTO media_cache VALUES(?1,?2,?3,?4) ON CONFLICT(tenant,bot,source_id) DO UPDATE SET uri=excluded.uri",params![binding.tenant,binding.bot,source,uri])?;
+        self.database.conn.lock().unwrap().execute("INSERT INTO media_cache VALUES(?1,?2,?3,?4) ON CONFLICT(tenant,bot,source_id) DO UPDATE SET uri=excluded.uri",params![binding.tenant,binding.bot,source,uri])?;
         Ok(())
     }
     pub fn links_initialized(&self, binding: &Binding) -> Result<bool> {
-        Ok(self.db.lock().unwrap().query_row(
+        Ok(self.database.conn.lock().unwrap().query_row(
             "SELECT EXISTS(SELECT 1 FROM link_bootstraps WHERE tenant=?1 AND bot=?2)",
             params![binding.tenant, binding.bot],
             |row| row.get(0),
         )?)
     }
     pub fn initialize_links(&self, binding: &Binding) -> Result<()> {
-        self.db.lock().unwrap().execute(
+        self.database.conn.lock().unwrap().execute(
             "INSERT OR IGNORE INTO link_bootstraps VALUES(?1,?2)",
             params![binding.tenant, binding.bot],
         )?;
@@ -400,7 +337,8 @@ impl Store {
     }
     pub fn sync_cursor(&self, binding: &Binding, kind: &str) -> Result<Option<i64>> {
         Ok(self
-            .db
+            .database
+            .conn
             .lock()
             .unwrap()
             .query_row(
@@ -411,19 +349,19 @@ impl Store {
             .optional()?)
     }
     pub fn set_sync_cursor(&self, binding: &Binding, kind: &str, cursor: i64) -> Result<()> {
-        self.db.lock().unwrap().execute("INSERT INTO sync_cursors VALUES(?1,?2,?3,?4) ON CONFLICT(tenant,bot,kind) DO UPDATE SET cursor=excluded.cursor",params![binding.tenant,binding.bot,kind,cursor])?;
+        self.database.conn.lock().unwrap().execute("INSERT INTO sync_cursors VALUES(?1,?2,?3,?4) ON CONFLICT(tenant,bot,kind) DO UPDATE SET cursor=excluded.cursor",params![binding.tenant,binding.bot,kind,cursor])?;
         Ok(())
     }
     pub fn fail(&self, tenant: &str, id: i64) -> Result<()> {
-        self.db.lock().unwrap().execute("UPDATE inbox SET state='failed',payload=NULL,error='unsupported event; owner notified' WHERE tenant=?1 AND id=?2",params![tenant,id])?;
+        self.database.conn.lock().unwrap().execute("UPDATE inbox SET state='failed',payload=NULL,error='unsupported event; owner notified' WHERE tenant=?1 AND id=?2",params![tenant,id])?;
         Ok(())
     }
     pub fn cache_avatar(&self, tenant: &str, bot: &str, hash: &str, uri: &str) -> Result<()> {
-        self.db.lock().unwrap().execute("INSERT INTO profiles(tenant,bot,avatar_hash,avatar_uri) VALUES(?1,?2,?3,?4) ON CONFLICT(tenant,bot) DO UPDATE SET avatar_hash=excluded.avatar_hash,avatar_uri=excluded.avatar_uri",params![tenant,bot,hash,uri])?;
+        self.database.conn.lock().unwrap().execute("INSERT INTO profiles(tenant,bot,avatar_hash,avatar_uri) VALUES(?1,?2,?3,?4) ON CONFLICT(tenant,bot) DO UPDATE SET avatar_hash=excluded.avatar_hash,avatar_uri=excluded.avatar_uri",params![tenant,bot,hash,uri])?;
         Ok(())
     }
     pub fn applied_profile(&self, tenant: &str, bot: &str, hash: &str) -> Result<()> {
-        self.db.lock().unwrap().execute(
+        self.database.conn.lock().unwrap().execute(
             "UPDATE profiles SET applied_hash=?3 WHERE tenant=?1 AND bot=?2",
             params![tenant, bot, hash],
         )?;
@@ -432,7 +370,7 @@ impl Store {
     fn encrypt(&self, aad: &str, bytes: &[u8]) -> Result<Vec<u8>> {
         let mut nonce = [0; 24];
         rand::thread_rng().fill_bytes(&mut nonce);
-        let ciphertext = self.cipher.encrypt(
+        let ciphertext = self.database.cipher.encrypt(
             XNonce::from_slice(&nonce),
             Payload {
                 msg: bytes,
@@ -443,7 +381,8 @@ impl Store {
     }
     fn decrypt(&self, aad: &str, bytes: &[u8]) -> Result<Vec<u8>> {
         ensure!(bytes.len() >= 40, "invalid encrypted payload");
-        self.cipher
+        self.database
+            .cipher
             .decrypt(
                 XNonce::from_slice(&bytes[..24]),
                 Payload {
@@ -455,7 +394,7 @@ impl Store {
     }
 
     pub fn bind_tenant(&self, tenant: &str, fingerprint: &str) -> Result<()> {
-        let db = self.db.lock().unwrap();
+        let db = self.database.conn.lock().unwrap();
         db.execute(
             "INSERT OR IGNORE INTO tenants VALUES (?1,?2)",
             params![tenant, fingerprint],
@@ -472,7 +411,7 @@ impl Store {
         Ok(())
     }
     pub fn bindings(&self, tenant: &str) -> Result<Vec<Binding>> {
-        let db = self.db.lock().unwrap();
+        let db = self.database.conn.lock().unwrap();
         let mut query = db.prepare(
             "SELECT tenant,bot,room,ghost,cursor FROM bindings WHERE tenant=?1 ORDER BY bot",
         )?;
@@ -489,7 +428,7 @@ impl Store {
             .collect::<rusqlite::Result<_>>()?)
     }
     pub fn add_binding(&self, binding: &Binding) -> Result<()> {
-        self.db.lock().unwrap().execute(
+        self.database.conn.lock().unwrap().execute(
             "INSERT INTO bindings VALUES (?1,?2,?3,?4,?5)",
             params![
                 binding.tenant,
@@ -502,7 +441,7 @@ impl Store {
         Ok(())
     }
     pub fn baseline(&self, tenant: &str, bot: &str, proposed: i64) -> Result<i64> {
-        let db = self.db.lock().unwrap();
+        let db = self.database.conn.lock().unwrap();
         db.execute(
             "INSERT OR IGNORE INTO provisions VALUES (?1,?2,?3)",
             params![tenant, bot, proposed],
@@ -514,7 +453,7 @@ impl Store {
         )?)
     }
     pub fn cursor(&self, binding: &Binding, cursor: i64) -> Result<()> {
-        self.db.lock().unwrap().execute(
+        self.database.conn.lock().unwrap().execute(
             "UPDATE bindings SET cursor=MAX(cursor,?3) WHERE tenant=?1 AND bot=?2",
             params![binding.tenant, binding.bot, cursor],
         )?;
@@ -526,7 +465,7 @@ impl Store {
         let before = baseline
             .checked_add(1)
             .context("history baseline overflow")?;
-        let db = self.db.lock().unwrap();
+        let db = self.database.conn.lock().unwrap();
         db.execute(
             "INSERT OR IGNORE INTO backfills(tenant,bot,before_seq) VALUES(?1,?2,?3)",
             params![binding.tenant, binding.bot, before],
@@ -539,12 +478,12 @@ impl Store {
         Ok((!done).then_some(before))
     }
     pub fn history_progress(&self, binding: &Binding, before: Option<i64>) -> Result<()> {
-        self.db.lock().unwrap().execute("UPDATE backfills SET before_seq=COALESCE(?3,before_seq),done=(?3 IS NULL) WHERE tenant=?1 AND bot=?2",params![binding.tenant,binding.bot,before])?;
+        self.database.conn.lock().unwrap().execute("UPDATE backfills SET before_seq=COALESCE(?3,before_seq),done=(?3 IS NULL) WHERE tenant=?1 AND bot=?2",params![binding.tenant,binding.bot,before])?;
         Ok(())
     }
     // Reserve before the HTTP request: its websocket echo may precede its response.
     pub fn reserve_history(&self, tenant: &str, ids: &[String]) -> Result<()> {
-        let mut db = self.db.lock().unwrap();
+        let mut db = self.database.conn.lock().unwrap();
         let tx = db.transaction()?;
         for id in ids {
             tx.execute(
@@ -558,7 +497,7 @@ impl Store {
 
     /// Commit the dedupe marker and all messages before acknowledging the homeserver.
     pub fn ingest(&self, tenant: &str, txn: &str, events: &[Inbound]) -> Result<()> {
-        let mut db = self.db.lock().unwrap();
+        let mut db = self.database.conn.lock().unwrap();
         let tx = db.transaction()?;
         let inserted = tx.execute(
             "INSERT OR IGNORE INTO transactions VALUES (?1,?2)",
@@ -592,7 +531,7 @@ impl Store {
     }
 
     pub fn next(&self, tenant: &str, now: i64) -> Result<Option<Pending>> {
-        let db = self.db.lock().unwrap();
+        let db = self.database.conn.lock().unwrap();
         let row = db.query_row("SELECT id,event_id,payload,attempts,next_at FROM inbox WHERE tenant=?1 AND state='pending' ORDER BY id LIMIT 1", [tenant], |r| {
             Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,Vec<u8>>(2)?,r.get::<_,u32>(3)?,r.get::<_,i64>(4)?))
         }).optional()?;
@@ -612,7 +551,7 @@ impl Store {
         }))
     }
     pub fn complete(&self, tenant: &str, id: i64) -> Result<()> {
-        self.db.lock().unwrap().execute(
+        self.database.conn.lock().unwrap().execute(
             "UPDATE inbox SET state='sent',payload=NULL,error=NULL WHERE tenant=?1 AND id=?2",
             params![tenant, id],
         )?;
@@ -620,11 +559,11 @@ impl Store {
     }
     pub fn retry(&self, tenant: &str, id: i64, attempts: u32, now: i64) -> Result<()> {
         let delay = (1_i64 << attempts.min(8)).min(300);
-        self.db.lock().unwrap().execute("UPDATE inbox SET attempts=attempts+1,next_at=?3,error='upstream delivery failed' WHERE tenant=?1 AND id=?2", params![tenant,id,now+delay])?;
+        self.database.conn.lock().unwrap().execute("UPDATE inbox SET attempts=attempts+1,next_at=?3,error='upstream delivery failed' WHERE tenant=?1 AND id=?2", params![tenant,id,now+delay])?;
         Ok(())
     }
     pub fn pending_count(&self) -> Result<i64> {
-        Ok(self.db.lock().unwrap().query_row(
+        Ok(self.database.conn.lock().unwrap().query_row(
             "SELECT count(*) FROM inbox WHERE state='pending'",
             [],
             |r| r.get(0),
@@ -638,7 +577,7 @@ impl Store {
         tenant: &str,
         obligation: &crate::fleet::ack::Obligation,
     ) -> Result<()> {
-        self.db.lock().unwrap().execute(
+        self.database.conn.lock().unwrap().execute(
             "INSERT OR IGNORE INTO ack_obligations
              (tenant,ack_id,message_id,thread,agent,created_at,due_by,seq,status,fulfilled_by,run_id,nudged_at,noticed_at,notice_attempts)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
@@ -668,7 +607,7 @@ impl Store {
         tenant: &str,
         ack_id: &str,
     ) -> Result<Option<crate::fleet::ack::Obligation>> {
-        let db = self.db.lock().unwrap();
+        let db = self.database.conn.lock().unwrap();
         let mut query = db.prepare(
             "SELECT ack_id,message_id,thread,agent,created_at,due_by,seq,status,fulfilled_by,run_id,nudged_at,noticed_at,notice_attempts
              FROM ack_obligations WHERE tenant=?1 AND ack_id=?2",
@@ -685,7 +624,7 @@ impl Store {
         agent: &str,
         thread: &str,
     ) -> Result<Vec<crate::fleet::ack::Obligation>> {
-        let db = self.db.lock().unwrap();
+        let db = self.database.conn.lock().unwrap();
         let mut query = db.prepare(
             "SELECT ack_id,message_id,thread,agent,created_at,due_by,seq,status,fulfilled_by,run_id,nudged_at,noticed_at,notice_attempts
              FROM ack_obligations WHERE tenant=?1 AND agent=?2 AND thread=?3 AND status='open' ORDER BY created_at, ack_id",
@@ -701,7 +640,7 @@ impl Store {
         tenant: &str,
         now: i64,
     ) -> Result<Vec<crate::fleet::ack::Obligation>> {
-        let db = self.db.lock().unwrap();
+        let db = self.database.conn.lock().unwrap();
         let mut query = db.prepare(
             "SELECT ack_id,message_id,thread,agent,created_at,due_by,seq,status,fulfilled_by,run_id,nudged_at,noticed_at,notice_attempts
              FROM ack_obligations WHERE tenant=?1 AND status='open' AND due_by<=?2 ORDER BY due_by, ack_id",
@@ -719,7 +658,7 @@ impl Store {
         reply: &str,
         run_id: Option<&str>,
     ) -> Result<()> {
-        self.db.lock().unwrap().execute(
+        self.database.conn.lock().unwrap().execute(
             "UPDATE ack_obligations SET status='fulfilled', fulfilled_by=?3, run_id=COALESCE(?4,run_id)
              WHERE tenant=?1 AND ack_id=?2 AND status='open'",
             params![tenant, ack_id, reply, run_id],
@@ -729,7 +668,7 @@ impl Store {
 
     /// Close a promise that was broken. `false` means it was already closed.
     pub fn expire_obligation(&self, tenant: &str, ack_id: &str) -> Result<bool> {
-        let changed = self.db.lock().unwrap().execute(
+        let changed = self.database.conn.lock().unwrap().execute(
             "UPDATE ack_obligations SET status='expired' WHERE tenant=?1 AND ack_id=?2 AND status='open'",
             params![tenant, ack_id],
         )?;
@@ -738,7 +677,7 @@ impl Store {
 
     /// Record the single nudge.
     pub fn nudge_obligation(&self, tenant: &str, ack_id: &str, at: i64) -> Result<()> {
-        self.db.lock().unwrap().execute(
+        self.database.conn.lock().unwrap().execute(
             "UPDATE ack_obligations SET nudged_at=?3 WHERE tenant=?1 AND ack_id=?2 AND nudged_at IS NULL",
             params![tenant, ack_id, at],
         )?;
@@ -747,7 +686,7 @@ impl Store {
 
     /// Record that the admission notice was delivered.
     pub fn notice_obligation(&self, tenant: &str, ack_id: &str, at: i64) -> Result<()> {
-        self.db.lock().unwrap().execute(
+        self.database.conn.lock().unwrap().execute(
             "UPDATE ack_obligations SET noticed_at=?3 WHERE tenant=?1 AND ack_id=?2",
             params![tenant, ack_id, at],
         )?;
@@ -756,7 +695,7 @@ impl Store {
 
     /// Record a failed admission attempt.
     pub fn notice_attempt(&self, tenant: &str, ack_id: &str) -> Result<()> {
-        self.db.lock().unwrap().execute(
+        self.database.conn.lock().unwrap().execute(
             "UPDATE ack_obligations SET notice_attempts=notice_attempts+1 WHERE tenant=?1 AND ack_id=?2",
             params![tenant, ack_id],
         )?;
@@ -765,7 +704,7 @@ impl Store {
 
     /// Drop a promise that was never made.
     pub fn remove_obligation(&self, tenant: &str, ack_id: &str) -> Result<()> {
-        self.db.lock().unwrap().execute(
+        self.database.conn.lock().unwrap().execute(
             "DELETE FROM ack_obligations WHERE tenant=?1 AND ack_id=?2",
             params![tenant, ack_id],
         )?;
@@ -774,7 +713,7 @@ impl Store {
 
     /// Every promise of one tenant, open or closed. Used by the status output.
     pub fn obligations(&self, tenant: &str) -> Result<Vec<crate::fleet::ack::Obligation>> {
-        let db = self.db.lock().unwrap();
+        let db = self.database.conn.lock().unwrap();
         let mut query = db.prepare(
             "SELECT ack_id,message_id,thread,agent,created_at,due_by,seq,status,fulfilled_by,run_id,nudged_at,noticed_at,notice_attempts
              FROM ack_obligations WHERE tenant=?1 ORDER BY created_at, ack_id",
@@ -794,7 +733,7 @@ impl Store {
         nonce: &str,
         purpose: &str,
     ) -> Result<()> {
-        self.db.lock().unwrap().execute(
+        self.database.conn.lock().unwrap().execute(
             "INSERT OR IGNORE INTO bridge_outbound VALUES (?1,?2,?3,?4)",
             params![binding.tenant, binding.bot, nonce, purpose],
         )?;
@@ -803,7 +742,7 @@ impl Store {
 
     /// True when a message in the agent's thread was written by the bridge.
     pub fn bridge_outbound(&self, binding: &Binding, nonce: &str) -> Result<bool> {
-        Ok(self.db.lock().unwrap().query_row(
+        Ok(self.database.conn.lock().unwrap().query_row(
             "SELECT EXISTS(SELECT 1 FROM bridge_outbound WHERE tenant=?1 AND bot=?2 AND nonce=?3)",
             params![binding.tenant, binding.bot, nonce],
             |row| row.get(0),
@@ -901,6 +840,7 @@ impl crate::fleet::ack::ObligationLedger for SqliteObligations {
 mod tests {
     use super::*;
     use crate::fleet::ack::{Obligation, ObligationStatus};
+    use base64::{Engine, engine::general_purpose::STANDARD};
 
     fn key() -> String {
         STANDARD.encode([7u8; 32])
