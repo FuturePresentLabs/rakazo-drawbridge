@@ -185,35 +185,7 @@ impl Tenant {
     }
 }
 
-pub fn secret(name: &str) -> Result<String> {
-    let file_name = format!("{name}_FILE");
-    let direct = std::env::var(name).ok();
-    let file = std::env::var(&file_name).ok();
-    let value = match (direct, file) {
-        (Some(value), None) => value,
-        (None, Some(path)) => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                ensure!(
-                    std::fs::metadata(&path)?.permissions().mode() & 0o077 == 0,
-                    "secret file referenced by {file_name} must be accessible only to its owner"
-                );
-            }
-            std::fs::read_to_string(path)
-                .with_context(|| format!("read secret file referenced by {file_name}"))?
-                .trim_end()
-                .to_string()
-        }
-        (Some(_), Some(_)) => bail!("set only one of {name} or {file_name}"),
-        (None, None) => bail!("set {name} or {file_name}"),
-    };
-    ensure!(
-        !value.trim().is_empty(),
-        "empty credential environment variable {name}"
-    );
-    Ok(value)
-}
+pub use drawbridge_core::secret;
 
 pub fn valid_slug(value: &str) -> bool {
     !value.is_empty()

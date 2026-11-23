@@ -7,6 +7,7 @@ license = "Apache-2.0"
 description = "Self-hosted and multi-tenant Rakazo to Beeper bridge"
 
 [dependencies]
+drawbridge-core = { git = "https://github.com/ajmwagar/drawbridge", rev = "ccf409c26ec2347eb3f551dc841252072f86dc94" }
 ammonia = "4.2"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 anyhow = "1"
