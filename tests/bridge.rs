@@ -2332,7 +2332,7 @@ async fn cli_accepts_private_secret_files_and_rejects_ambiguous_credentials() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("set only one"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("set exactly one"));
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

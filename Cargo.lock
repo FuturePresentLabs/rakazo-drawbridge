@@ -492,6 +492,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "drawbridge-core"
+version = "0.1.0"
+source = "git+https://github.com/ajmwagar/drawbridge?rev=ccf409c26ec2347eb3f551dc841252072f86dc94#ccf409c26ec2347eb3f551dc841252072f86dc94"
+dependencies = [
+ "anyhow",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "url",
+]
+
+[[package]]
 name = "dtoa"
 version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1494,6 +1507,7 @@ dependencies = [
  "chrono",
  "clap",
  "ctr",
+ "drawbridge-core",
  "fs2",
  "futures-util",
  "hex",

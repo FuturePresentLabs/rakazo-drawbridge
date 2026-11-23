@@ -10,20 +10,12 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
-    time::{SystemTime, UNIX_EPOCH},
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
-pub fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
+pub use drawbridge_core::now;
 
 pub struct TenantRuntime {
     pub config: Tenant,

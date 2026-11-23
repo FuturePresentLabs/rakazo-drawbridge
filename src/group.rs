@@ -211,11 +211,18 @@ mod tests {
     }
 
     fn group(policy: OptInPolicy) -> Group {
-        let mut g = Group::new(GroupId("irc:#orch".into()), TransportKind::Irc, "#orch".into());
+        let mut g = Group::new(
+            GroupId("irc:#orch".into()),
+            TransportKind::Irc,
+            "#orch".into(),
+        );
         g.opt_in = policy;
-        g.members.push(member("fleet-orch-v1", MemberRole::Orchestrator, false));
-        g.members.push(member("fleet-pm-rakazo-v1", MemberRole::Pm, true));
-        g.members.push(member("human:alice", MemberRole::Human, false));
+        g.members
+            .push(member("fleet-orch-v1", MemberRole::Orchestrator, false));
+        g.members
+            .push(member("fleet-pm-rakazo-v1", MemberRole::Pm, true));
+        g.members
+            .push(member("human:alice", MemberRole::Human, false));
         g
     }
 
@@ -240,7 +247,11 @@ mod tests {
     #[test]
     fn orchestrator_only_human_message_notifies_orch() {
         let g = group(OptInPolicy::OrchestratorOnly);
-        assert!(should_respond(&g, &msg("human:alice", &[]), "fleet-orch-v1"));
+        assert!(should_respond(
+            &g,
+            &msg("human:alice", &[]),
+            "fleet-orch-v1"
+        ));
     }
 
     #[test]
@@ -260,7 +271,8 @@ mod tests {
         // relay_only agents never reply even when mentioned; a non-relay
         // member who is @mentioned does.
         let mut g = group(OptInPolicy::AddressedOnly);
-        g.members.push(member("worker-x", MemberRole::Worker, false));
+        g.members
+            .push(member("worker-x", MemberRole::Worker, false));
         assert!(should_respond(
             &g,
             &msg("human:alice", &["worker-x"]),
@@ -276,13 +288,21 @@ mod tests {
     #[test]
     fn no_echo() {
         let g = group(OptInPolicy::All);
-        assert!(!should_respond(&g, &msg("fleet-orch-v1", &[]), "fleet-orch-v1"));
+        assert!(!should_respond(
+            &g,
+            &msg("fleet-orch-v1", &[]),
+            "fleet-orch-v1"
+        ));
     }
 
     #[test]
     fn relay_only_never_responds() {
         let g = group(OptInPolicy::All);
-        assert!(!should_respond(&g, &msg("human:alice", &[]), "fleet-pm-rakazo-v1"));
+        assert!(!should_respond(
+            &g,
+            &msg("human:alice", &[]),
+            "fleet-pm-rakazo-v1"
+        ));
     }
 
     #[test]
