@@ -494,6 +494,32 @@ dependencies = [
 [[package]]
 name = "drawbridge-core"
 version = "0.1.0"
+source = "git+https://github.com/ajmwagar/drawbridge?rev=51d431bc81b7d1ff7f6ff971f24e34f5083ccf5d#51d431bc81b7d1ff7f6ff971f24e34f5083ccf5d"
+dependencies = [
+ "anyhow",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "url",
+]
+
+[[package]]
+name = "drawbridge-core"
+version = "0.1.0"
+source = "git+https://github.com/ajmwagar/drawbridge?rev=6757c61bd5aeff41a15f1619a902b78a6b356ee7#6757c61bd5aeff41a15f1619a902b78a6b356ee7"
+dependencies = [
+ "anyhow",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "url",
+]
+
+[[package]]
+name = "drawbridge-core"
+version = "0.1.0"
 source = "git+https://github.com/ajmwagar/drawbridge?rev=ccf409c26ec2347eb3f551dc841252072f86dc94#ccf409c26ec2347eb3f551dc841252072f86dc94"
 dependencies = [
  "anyhow",
@@ -507,15 +533,32 @@ dependencies = [
 [[package]]
 name = "drawbridge-matrix"
 version = "0.1.0"
-source = "git+https://github.com/ajmwagar/drawbridge?rev=ccf409c26ec2347eb3f551dc841252072f86dc94#ccf409c26ec2347eb3f551dc841252072f86dc94"
+source = "git+https://github.com/ajmwagar/drawbridge?rev=6757c61bd5aeff41a15f1619a902b78a6b356ee7#6757c61bd5aeff41a15f1619a902b78a6b356ee7"
 dependencies = [
  "anyhow",
- "drawbridge-core",
+ "drawbridge-core 0.1.0 (git+https://github.com/ajmwagar/drawbridge?rev=6757c61bd5aeff41a15f1619a902b78a6b356ee7)",
  "regex",
  "reqwest",
  "serde",
  "serde_json",
  "url",
+]
+
+[[package]]
+name = "drawbridge-store"
+version = "0.1.0"
+source = "git+https://github.com/ajmwagar/drawbridge?rev=51d431bc81b7d1ff7f6ff971f24e34f5083ccf5d#51d431bc81b7d1ff7f6ff971f24e34f5083ccf5d"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chacha20poly1305",
+ "drawbridge-core 0.1.0 (git+https://github.com/ajmwagar/drawbridge?rev=51d431bc81b7d1ff7f6ff971f24e34f5083ccf5d)",
+ "fs2",
+ "rand 0.8.8",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -1521,8 +1564,9 @@ dependencies = [
  "chrono",
  "clap",
  "ctr",
- "drawbridge-core",
+ "drawbridge-core 0.1.0 (git+https://github.com/ajmwagar/drawbridge?rev=ccf409c26ec2347eb3f551dc841252072f86dc94)",
  "drawbridge-matrix",
+ "drawbridge-store",
  "fs2",
  "futures-util",
  "hex",
